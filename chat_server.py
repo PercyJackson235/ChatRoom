@@ -2,23 +2,27 @@
 from socketserver import ThreadingTCPServer, BaseRequestHandler
 import ssl, socket
 from Crypto.Cipher import AES
+from Crypto import Random
 import signal, threading, select
 from time import sleep
+import os, subprocess
 
 class ChatServer(ThreadingTCPServer):
     allow_reuse_address = True
     request_queue_size = 15
     block_on_close = False
-    def __init__(self, server_address, RequestHandlerClass, server_ssl=True, bind_and_activate=True):
+    def __init__(self, server_address, RequestHandlerClass, server_ssl=True, bind_and_activate=True, encrypted=True):
         ThreadingTCPServer.__init__(self, server_address, RequestHandlerClass, False)
-        self.ssl = server_ssl
+        self.secure = server_ssl
         self.__shutdown_request = False
         self.networked = []
         self.messagebox = []
         self.watch = threading.Thread(target=self._network_watch)
         self.watch.start()
-        print(f"server_sell is",server_ssl)
-        print(f"self.ssl is",self.ssl)
+        self._key = Random.new().read(AES.key_size[-1])
+        self._cipherobj = AES.new(self._key, AES.MODE_CBC, Random.new().read(AES.block_size))
+        self._encrypted = encrypted
+        self._aes_buffer = b'\x90' * 3 + b'\x05'
         signal.signal(signal.SIGINT, self.stop_thread)
         if bind_and_activate:
             try:
@@ -31,14 +35,24 @@ class ChatServer(ThreadingTCPServer):
     def server_bind(self):
         if self.allow_reuse_address:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if self.ssl:
-            context = ssl.SSLContext()
-            context.load_cert_chain('cert.pem','key.pem')
-            self.socket = context.wrap_socket(self.socket, server_side=True)
         self.socket.bind(self.server_address)
+        self.socket.listen()
         self.server_address = self.socket.getsockname()
+        if self.secure:
+            cert, key = 'certs/cert.pem', 'certs/key.pem'
+            if not all(map(os.path.exists, (cert, key))):
+                print("Missing certificates. Running cert_create.sh")
+                output = open(os.devnull, 'w+')
+                if 0 != subprocess.run('/bin/sh cert_create.sh'.split(),stdout=output, stderr=output).returncode:
+                    print("Unrecoveable error. Missing Certificate and cert_create.sh failed!")
+                    os.sys.exit(1)
+            context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(certfile=cert, keyfile=key)
+            self.socket = context.wrap_socket(self.socket, server_side=True)
 
     def verify_request(self, request, client_address):
+        if self._encrypted:
+            request.sendall(self._aes_buffer + self._key + self._aes_buffer)
         self.networked.append(request)
         return True
 
@@ -50,10 +64,7 @@ class ChatServer(ThreadingTCPServer):
             yield msg[pos : pos + 4096]
 
     def _network_watch(self):
-        #print(dir(self))
         while not self.__shutdown_request:
-            print(self.messagebox)
-            #for msg, endpoint in self.messagebox:
             while 0 < len(self.messagebox):
                 msg, endpoint = self.messagebox.pop(0)
                 closed_connections = []
@@ -68,14 +79,29 @@ class ChatServer(ThreadingTCPServer):
                 for sock in closed_connections:
                     self.networked.remove(sock)
             sleep(3)
-        del self.networked
     
     def server_stop(self):
+        SHUTDOWN = b'\x90' * 3 + b'\x04'
+        SEP = b'\x90' * 3 + b'\x02'
+        if self._encrypted:
+            SHUTDOWN = self._padding(SHUTDOWN)
+            SHUTDOWN = self._cipherobj.IV + SEP + self._cipherobj.encrypt(SHUTDOWN)
         self.__shutdown_request = True
         self.watch.join()
         print("Shutting down....")
+        for sock in self.networked:
+            if sock.fileno() != -1:
+                sock.sendall(SHUTDOWN)
         self.shutdown()
+        #print("Hitting server_close()")
         self.server_close()
+        os.sys.exit(0)
+
+    def _padding(self, text:bytes):
+        pad = len(text) % 16
+        if pad != 0:
+            text += b'\x00' * (16 - pad)
+        return text
 
     def stop_thread(self, frame=None, sig=None):
         thread = threading.Thread(target=self.server_stop)
@@ -105,5 +131,16 @@ class ChatHandler(BaseRequestHandler):
 
 
 if __name__ == "__main__":
-    chat = ChatServer(('localhost', 300), ChatHandler, server_ssl=False)
+    import argparse
+    parser = argparse.ArgumentParser(description="A Chat Server written in Python3.")
+    parser.add_argument('-i', default="pythonchatroom.com", dest="host", help="Host")
+    parser.add_argument('-p', default=3000, type=int, dest="port", help="port")
+    parser.add_argument('-s', dest="server_ssl", default=False, action="store_true", help="Turn on ssl")
+    parser.add_argument('--no-encrypt', dest="encrypted", default=True, action="store_false",
+                        help="Turn off AES encryption")
+    args = parser.parse_args()
+    args.server_address = args.host, args.port
+    args.RequestHandlerClass = ChatHandler
+    del args.host, args.port
+    chat = ChatServer(**vars(args))
     chat.serve_forever()

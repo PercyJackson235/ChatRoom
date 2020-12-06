@@ -7,15 +7,22 @@ import socket
 from threading import Thread
 import select
 from Crypto.Cipher import AES
+from Crypto import Random
+import ssl
 
 class ChatWindow(object):
-    def __init__(self, address:str = None, port:int = 300, name:str = None):
+    def __init__(self, address:str = None, port:int = 3000, name:str = None, secure=False, encrypted=True):
         self.address = address
         self.port = int(port)
         self.name = name
         self._EOF = b'\x90' * 3 + b'\x03'
         self._STOP = b'\x90' * 3 + b'\x04'
+        self._SEP = b'\x90' * 3 + b'\x02'
+        self._aes_buffer = b'\x90' * 3 + b'\x05'
+        self._aes_pack_len = 40
+        self._encrypted = encrypted
         self._running = False
+        self._exit = False
         self.window = tkinter.Tk()
         self.window.attributes('-zoomed', True)
         if self.name:
@@ -42,17 +49,17 @@ class ChatWindow(object):
         self.sendbtn.pack(side=tkinter.RIGHT)
         bottomframe.pack(expand=True, fill=tkinter.BOTH)
         self.sock = None
-        self.cihperobj = AES.new('PercyJackson235!')
+        self.secure = secure
         #self.window.mainloop()
         #print(dir(self))
 
     def _login(self):
-        time.sleep(0.5)
+        time.sleep(0.7)
         self._all_btns('disabled')
         try:
             self.name = simpledialog.askstring('Login','What is your name?', parent=self.window)
         except:
-            self.name = 'guest'
+            pass
         finally:
             self._all_btns('normal')
         self.window.title(f'PyChat[{self.name}]')
@@ -65,19 +72,32 @@ class ChatWindow(object):
 
     def start(self):
         if self.name == None:
-            Thread(target=self._login)
-        Thread(target=self._incoming).start()
+            Thread(target=self._login).start()
+        #Thread(target=self._incoming).start()
         self.window.mainloop()
 
     def connect(self):
         self.sock = socket.socket()
+        if self.secure:
+            if not ssl.os.path.exists('certs/cert.pem'):
+                print("Mising certificate")
+                ssl.sys.exit(1)
+            context = ssl.create_default_context(cafile='certs/cert.pem')
+            self.sock = context.wrap_socket(self.sock, server_hostname=self.address)
         try:
             self.sock.connect((self.address, self.port))
             self._button_swap(self.stopbtn, self.startbtn)
+            if self._encrypted:
+                msg = b''
+                while len(msg) < self._aes_pack_len:
+                    msg += self.sock.recv(self._aes_pack_len)
+                self._key = msg.strip(self._aes_buffer)
             self._running = True
-        except:
+            Thread(target=self._incoming).start()
+        except Exception as e:
             self._button_swap(self.startbtn, self.stopbtn)
             self._running = False
+            print(e)
 
     def disconnect(self):
         try:
@@ -94,39 +114,53 @@ class ChatWindow(object):
         offbtn.configure(state='disabled')
 
     def send(self):
-        text = f"{self.name}: " + self.textbox.get(1.0, tkinter.END)[:-1]
-        print(text, end='')
-        print('\nAbove is "self.text.get(1.0, tkinter.END)[:-1]"')
+        text = f"{self.name} : " + self.textbox.get(1.0, tkinter.END)[:-1]
         self.textbox.delete(1.0, tkinter.END)
         self.text_insert(text + '\n')
-        text = text.encode() + self._EOF
+        text = text.encode()
         pad = len(text) % 16
         if pad != 0:
             text += b'\x00' * (16 - pad)
-            print(len(text) % 16)
+        if self._encrypted:
+            iv = Random.new().read(AES.block_size)
+            text = iv + self._SEP + AES.new(self._key, AES.MODE_CBC, iv).encrypt(text)
+        text += self._EOF
         for chunk in self._chunker(text):
-            chunk = self.cihperobj.encrypt(chunk)
-            print(len(chunk))
-            print('Sent ',self.sock.send(chunk))
+            self.sock.send(chunk)
 
     def _chunker(self, msg: bytes):
         for pos in range(0,len(msg), 4096):
             yield msg[pos : pos + 4096]
 
     def _incoming(self):
-        print('inside incoming loop')
         while not self._running:
             time.sleep(0.25)
         while self._running:
-            print('inside run loop')
-            if select.select([self.sock],[],[],2.0)[0] and self._running:
-                print('inside select loop')
+            if self._running and select.select([self.sock],[],[],2.0)[0]:
                 msg = self.sock.recv(4096)
-                print(len(msg))
-                msg = self.cihperobj.decrypt(msg)
-                msg = msg.rstrip(b'\x00')
-                msg = msg.replace(self._EOF, b'\n').decode()
-                self.text_insert(msg)
+                end = ''
+                if self._encrypted:
+                    #while (len(msg) % 16) == 4:
+                    #    msg += self.sock.read(16)
+                    end = msg[len(msg)-len(self._EOF):]
+                    if end == self._EOF:
+                        end = '\n'
+                        msg = msg[:len(msg)-len(self._EOF)]
+                    else:
+                        end = ''
+                    iv, msg = msg.split(self._SEP)
+                    try:
+                        msg = AES.new(self._key, AES.MODE_CBC, iv).decrypt(msg)
+                    except ValueError as e:
+                        print(e)
+                        continue
+                msg = msg.strip(b'\x00')
+                if msg == self._STOP:
+                    self._running =  not self._running
+                    self.disconnect()
+                    AlertBox(self.window, "Server is shutting down", ['OK'])
+                    break
+                self.text_insert(msg.decode() + end)
 
     def text_insert(self, text:str):
         self.messages.configure(state='normal')
@@ -143,14 +177,20 @@ class ChatWindow(object):
             self.sock.sendall(self._STOP * 4)
             self.sock.close()
 
+class AlertBox(simpledialog.SimpleDialog):
+    def _set_transient(self, master, relx=10, rely=10):
+        super()._set_transient(master, relx, rely)
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="A GUI python chat client")
-    parser.add_argument('-i', '--address', type=str, required=True,
+    parser.add_argument('-i', '--address', type=str, required=True, default="pythonchatroom.com",
                         help='Chat Server Hostname or IP Address')
-    parser.add_argument('-p', '--port', required=True, type=int, help='Chat Server port number')
+    parser.add_argument('-p', '--port', required=True, type=int, default=300,
+                        help='Chat Server port number')
     parser.add_argument('-l', '--login', dest='name',
                         default=None, help='Chat Server Credentials')
+    parser.add_argument('-s', dest="secure", action="store_true", help="Turn on ssl")
     args = parser.parse_args()
     with ChatWindow(**vars(args)) as chatclient:
         chatclient.start()
