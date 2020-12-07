@@ -6,6 +6,8 @@ from Crypto import Random
 import signal, threading, select
 from time import sleep
 import os, subprocess
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.fernet import Fernet
 
 class ChatServer(ThreadingTCPServer):
     allow_reuse_address = True
@@ -19,10 +21,14 @@ class ChatServer(ThreadingTCPServer):
         self.messagebox = []
         self.watch = threading.Thread(target=self._network_watch)
         self.watch.start()
-        self._key = Random.new().read(AES.key_size[-1])
-        self._cipherobj = AES.new(self._key, AES.MODE_CBC, Random.new().read(AES.block_size))
+        #self._key = Random.new().read(AES.key_size[-1])
+        self._key = os.urandom(32)
+        #self._cipherobj = AES.new(self._key, AES.MODE_CBC, Random.new().read(AES.block_size))
         self._encrypted = encrypted
         self._aes_buffer = b'\x90' * 3 + b'\x05'
+        self._SEP = b'\x90' * 3 + b'\x02'
+        self._EOF = b'\x90' * 3 + b'\x03'
+        self._SHUTDOWN = b'\x90' * 3 + b'\x04'
         signal.signal(signal.SIGINT, self.stop_thread)
         if bind_and_activate:
             try:
@@ -49,6 +55,7 @@ class ChatServer(ThreadingTCPServer):
             context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
             context.load_cert_chain(certfile=cert, keyfile=key)
             self.socket = context.wrap_socket(self.socket, server_side=True)
+        print(f"Server listening on {self.socket.getsockname()}.")
 
     def verify_request(self, request, client_address):
         if self._encrypted:
@@ -81,14 +88,14 @@ class ChatServer(ThreadingTCPServer):
             sleep(3)
     
     def server_stop(self):
-        SHUTDOWN = b'\x90' * 3 + b'\x04'
-        SEP = b'\x90' * 3 + b'\x02'
+        SHUTDOWN = self._SHUTDOWN
         if self._encrypted:
             SHUTDOWN = self._padding(SHUTDOWN)
-            SHUTDOWN = self._cipherobj.IV + SEP + self._cipherobj.encrypt(SHUTDOWN)
+            #SHUTDOWN = self._cipherobj.IV + SEP + self._cipherobj.encrypt(SHUTDOWN)
+            SHUTDOWN = self._aes_encrypt(SHUTDOWN)
         self.__shutdown_request = True
         self.watch.join()
-        print("Shutting down....")
+        print("\nShutting down....")
         for sock in self.networked:
             if sock.fileno() != -1:
                 sock.sendall(SHUTDOWN)
@@ -107,10 +114,17 @@ class ChatServer(ThreadingTCPServer):
         thread = threading.Thread(target=self.server_stop)
         thread.start()
 
+    def _aes_encrypt(self, msg:bytes):
+        iv = os.urandom(16)
+        encryptor = Cipher(algorithms.AES(self._key), modes.CBC(iv))
+        encryptor = encryptor.encryptor()
+        ciphertext = encryptor.update(msg) + encryptor.finalize()
+        return iv + self._SEP + ciphertext
+
 class ChatHandler(BaseRequestHandler):
     def handle(self):
-        EOF = b'\x90' * 3 + b'\x03'
-        SHUTDOWN = b'\x90' * 3 + b'\x04'  
+        EOF = self.server._EOF
+        SHUTDOWN = self.server._SHUTDOWN  
         while self.request.fileno() != -1:
             sent_data = b''
             while True:

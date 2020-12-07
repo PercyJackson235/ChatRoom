@@ -1,14 +1,14 @@
 #!/usr/bin/python3
 import tkinter
-from tkinter import scrolledtext
-from tkinter import simpledialog
+from tkinter import scrolledtext, simpledialog, messagebox
 import time
 import socket
 from threading import Thread
 import select
-from Crypto.Cipher import AES
-from Crypto import Random
+import sys, os
 import ssl
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.fernet import Fernet
 
 class ChatWindow(object):
     def __init__(self, address:str = None, port:int = 3000, name:str = None, secure=False, encrypted=True):
@@ -38,7 +38,6 @@ class ChatWindow(object):
         topframe.pack(side=tkinter.TOP)#, pady=(5,0))
         middleframe = tkinter.Frame(self.window)
         self.messages = scrolledtext.ScrolledText(middleframe)
-        #self.messages.insert(tkinter.END, 'hello')
         self.messages.pack(expand=True, fill=tkinter.BOTH, side=tkinter.BOTTOM, pady=(5,2), padx=10)
         self.messages.configure(state="disabled")
         middleframe.pack(expand=True, fill=tkinter.BOTH)
@@ -78,10 +77,10 @@ class ChatWindow(object):
 
     def connect(self):
         self.sock = socket.socket()
-        if self.secure:
-            if not ssl.os.path.exists('certs/cert.pem'):
+        if bool(self.secure):
+            if not os.path.exists('certs/cert.pem'):
                 print("Mising certificate")
-                ssl.sys.exit(1)
+                sys.exit(1)
             context = ssl.create_default_context(cafile='certs/cert.pem')
             self.sock = context.wrap_socket(self.sock, server_hostname=self.address)
         try:
@@ -122,8 +121,7 @@ class ChatWindow(object):
         if pad != 0:
             text += b'\x00' * (16 - pad)
         if self._encrypted:
-            iv = Random.new().read(AES.block_size)
-            text = iv + self._SEP + AES.new(self._key, AES.MODE_CBC, iv).encrypt(text)
+            text = self._aes_encrypt(text)
         text += self._EOF
         for chunk in self._chunker(text):
             self.sock.send(chunk)
@@ -150,7 +148,7 @@ class ChatWindow(object):
                         end = ''
                     iv, msg = msg.split(self._SEP)
                     try:
-                        msg = AES.new(self._key, AES.MODE_CBC, iv).decrypt(msg)
+                        msg = self._aes_decypt(msg, iv)
                     except ValueError as e:
                         print(e)
                         continue
@@ -158,9 +156,49 @@ class ChatWindow(object):
                 if msg == self._STOP:
                     self._running =  not self._running
                     self.disconnect()
-                    AlertBox(self.window, "Server is shutting down", ['OK'])
-                    break
-                self.text_insert(msg.decode() + end)
+                    try:
+                        if AlertBox('Alert', 'Server has shutdown. Would you like to retry '
+                                    'connection or cancel application?'):
+                            while True:
+                                if self._reconnect_check():
+                                    AlertBox('Reconnection', 'Connection to server has be regained.',
+                                              messagebox.INFO, messagebox.OK)
+                                    break
+                                elif AlertBox('Reconnection Error', 'Server is unresponsive. Would you '
+                                              'like to retry reconnection?', messagebox.INFO, messagebox.YESNO):
+                                    continue
+                                else:
+                                    AlertBox('Alert', 'Unable to reconnect to server. Shutting down. Please'
+                                             ' try again later.', messagebox.WARNING, messagebox.OK)
+                                    self.window.quit()
+                        else:
+                            self.window.quit()
+                    except:
+                        return
+                if msg != self._STOP:    
+                    self.text_insert(msg.decode() + end)
+
+    def _reconnect_check(self):
+        count = 0
+        for i in sleep_time():
+            count += i
+            time.sleep(i)
+            self.connect()
+            time.sleep(1)
+            if self._running:
+                return True
+            if count > 540:
+                return False
+
+    def _aes_decypt(self, msg:bytes, iv:bytes):
+        decryptor = Cipher(algorithms.AES(self._key), modes.CBC(iv)).decryptor()
+        return decryptor.update(msg) + decryptor.finalize()
+
+    def _aes_encrypt(self, msg:bytes):
+        iv = os.urandom(16)
+        encryptor = Cipher(algorithms.AES(self._key), modes.CBC(iv)).encryptor()
+        ciphertext = encryptor.update(msg) + encryptor.finalize()
+        return iv + self._SEP + ciphertext
 
     def text_insert(self, text:str):
         self.messages.configure(state='normal')
@@ -177,20 +215,32 @@ class ChatWindow(object):
             self.sock.sendall(self._STOP * 4)
             self.sock.close()
 
-class AlertBox(simpledialog.SimpleDialog):
-    def _set_transient(self, master, relx=10, rely=10):
-        super()._set_transient(master, relx, rely)
+def AlertBox(title=None, message=None, alert_icon=messagebox.WARNING,
+              alert_buttons=messagebox.RETRYCANCEL, **options):
+    """Shows an Alert Message"""
+    result = messagebox._show(title, message, alert_icon, alert_buttons, **options)
+    return result == messagebox.RETRY or result == messagebox.YES
+
+def sleep_time():
+    secs = 5
+    while True:
+        yield secs
+        if secs < 30:
+            secs += 5
+        elif secs == 30:
+            secs = 5
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="A GUI python chat client")
     parser.add_argument('-i', '--address', type=str, required=True, default="pythonchatroom.com",
                         help='Chat Server Hostname or IP Address')
-    parser.add_argument('-p', '--port', required=True, type=int, default=300,
+    parser.add_argument('-p', '--port', required=True, type=int, default=3000,
                         help='Chat Server port number')
-    parser.add_argument('-l', '--login', dest='name',
-                        default=None, help='Chat Server Credentials')
-    parser.add_argument('-s', dest="secure", action="store_true", help="Turn on ssl")
+    parser.add_argument('-l', '--login', dest='name', default=None, help='Chat Server Credentials')
+    parser.add_argument('-s', dest="secure", default=False, const="certs/cert.pem", nargs="?",
+                        help=f"Turn on ssl. -s defaults to {os.path.sep.join(('certs','cert.pem'))}"
+                        "\nAdd a filename after the switch option to\nspecify an alternate certificate.")
     args = parser.parse_args()
     with ChatWindow(**vars(args)) as chatclient:
         chatclient.start()

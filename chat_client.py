@@ -1,12 +1,12 @@
 #!/usr/bin/python3
 import socket, ssl
-import sys
+import sys, os
 import threading
 import time
 import select
 import signal
-from Crypto.Cipher import AES
-from Crypto import Random
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.fernet import Fernet
 
 class ChatClient(object):
     def __init__(self, address:str, port:int, name:str=None, 
@@ -29,18 +29,24 @@ class ChatClient(object):
 
     def connect(self):
         self.sock = socket.socket()
-        if not ssl.os.path.exists('certs/cert.pem'):
-            print("Mising certificate")
-            ssl.sys.exit(1)
-        if self._secure:
-            context = ssl.create_default_context(cafile="certs/cert.pem")
+        if bool(self._secure):
+            if not os.path.exists(self._secure):
+                print("Mising certificate")
+                sys.exit(1)
+            context = ssl.create_default_context(cafile=self._secure)
             self.sock = context.wrap_socket(self.sock, server_hostname=self.address)
-        self.sock.connect((self.address, self.port))
+        try:
+            self.sock.connect((self.address, self.port))
+        except ConnectionRefusedError:
+            self._running = False
+            self._refused = True
+            return
         if self._encrypted:
             msg = b''
             while len(msg) < self._aes_pack_len:
                 msg += self.sock.recv(self._aes_pack_len)
             self._key = msg.strip(self._aes_buffer)
+        self._running = True
 
     def _incoming(self):
         while self._running:
@@ -58,15 +64,44 @@ class ChatClient(object):
                         end = ''
                     iv, msg = msg.split(self._SEP)
                     try:
-                        msg = AES.new(self._key, AES.MODE_CBC, iv).decrypt(msg)
+                        msg = self._aes_decypt(msg, iv)
                     except ValueError as e:
                         print(e)
                         continue
                 msg = msg.strip(b'\x00')
                 if msg == self._STOP:
                     self._running = False
+                    self.sock.sendall(self._STOP)
+                    self.sock.close()
+                    cmd = ''
+                    answer_dict = {'y' : True , 'n' : False, 'yes': True, 'no' : False}
+                    while True:
+                        cmd = input("We have lost contact with the server.\n"
+                                    "Would you like to attempt reconnection? [yes | no] ").strip()
+                        time.sleep(1)
+                        if cmd.lower() not in answer_dict.keys():
+                            continue
+                        if answer_dict[cmd]:
+                            print("Ok! Attempting to reconnect to server.")
+                            if self._reconnect_check():
+                                print("We have reconnected to server.")
+                                break
+                        else:
+                            print("Ok. Shutting Down.")
+                            break
                 else:
                     print(msg.decode() + end, end='')
+
+    def _aes_decypt(self, msg:bytes, iv:bytes):
+        decryptor = Cipher(algorithms.AES(self._key), modes.CBC(iv)).decryptor()
+        return decryptor.update(msg) + decryptor.finalize()
+
+    def _aes_encrypt(self, msg:bytes):
+        iv = os.urandom(16)
+        encryptor = Cipher(algorithms.AES(self._key), modes.CBC(iv))
+        encryptor = encryptor.encryptor()
+        ciphertext = encryptor.update(msg) + encryptor.finalize()
+        return iv + self._SEP + ciphertext
 
     def _outgoing(self):
         while self._running:
@@ -76,11 +111,10 @@ class ChatClient(object):
                 if text.lower() in ['exit', 'quit', 'end']:
                     self._running = False
                     break
-                text = self.name.encode() + b' : ' + text.encode()# + self._EOF
+                text = self.name.encode() + b' : ' + text.encode()
                 if self._encrypted:
                     text = self._padding(text)
-                    iv = Random.new().read(AES.block_size)
-                    text = iv + self._SEP + AES.new(self._key, AES.MODE_CBC, iv).encrypt(text)
+                    text = self._aes_encrypt(text)
                 self.sock.sendall(text + self._EOF)
                 sys.stdin.flush()
         time.sleep(2)
@@ -109,21 +143,45 @@ class ChatClient(object):
             pass
         finally:
             self.stop_daemon()
-            self.sock.send(self._STOP)
+            if hasattr(self,'_refused') and not self._refused:
+                self.sock.send(self._STOP)
             self.sock.close()
     
     def stop_daemon(self, frame=None, sig=None):
         if sig is not None:
             print()
         self._running = False
-            
+
+    def _reconnect_check(self):
+        count = 0
+        for i in sleep_time():
+            count += i
+            time.sleep(i)
+            self.connect()
+            time.sleep(1)
+            if self._running:
+                return True
+            if count > 60: #540:
+                return False
+
+def sleep_time():
+    secs = 5
+    while True:
+        yield secs
+        if secs < 30:
+            secs += 5
+        elif secs == 30:
+            secs = 5
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Python Chatroom Client")
+    parser = argparse.ArgumentParser(description="Python Chatroom Client", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('-i', default="pythonchatroom.com", dest="address", help="Host")
     parser.add_argument('-p', default=3000, type=int, dest="port", help="port")
     parser.add_argument('-l', dest="name", help="Login name")
-    parser.add_argument('-s', dest="secure", default=False, action="store_true", help="Turn on ssl")
+    parser.add_argument('-s', dest="secure", default=False, const="certs/cert.pem", nargs="?",
+                        help=f"Turn on ssl. -s defaults to {os.path.sep.join(('certs','cert.pem'))}"
+                        "\nAdd a filename after the switch option to\nspecify an alternate certificate.")
     parser.add_argument('--no-encrypt', dest="encrypted", default=True, action="store_false",
                         help="Turn off AES encryption")
     args = parser.parse_args()
