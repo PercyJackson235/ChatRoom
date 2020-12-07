@@ -127,6 +127,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-*.pem
+key*
 dev/
-cert*/
+chatroom.pem
+aws*
+*cmd*
