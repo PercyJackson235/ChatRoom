@@ -1,8 +1,6 @@
 #!/usr/bin/python3
 from socketserver import ThreadingTCPServer, BaseRequestHandler
 import ssl, socket
-from Crypto.Cipher import AES
-from Crypto import Random
 import signal, threading, select
 from time import sleep
 import os, subprocess
@@ -21,9 +19,7 @@ class ChatServer(ThreadingTCPServer):
         self.messagebox = []
         self.watch = threading.Thread(target=self._network_watch)
         self.watch.start()
-        #self._key = Random.new().read(AES.key_size[-1])
         self._key = os.urandom(32)
-        #self._cipherobj = AES.new(self._key, AES.MODE_CBC, Random.new().read(AES.block_size))
         self._encrypted = encrypted
         self._aes_buffer = b'\x90' * 3 + b'\x05'
         self._SEP = b'\x90' * 3 + b'\x02'
@@ -91,7 +87,6 @@ class ChatServer(ThreadingTCPServer):
         SHUTDOWN = self._SHUTDOWN
         if self._encrypted:
             SHUTDOWN = self._padding(SHUTDOWN)
-            #SHUTDOWN = self._cipherobj.IV + SEP + self._cipherobj.encrypt(SHUTDOWN)
             SHUTDOWN = self._aes_encrypt(SHUTDOWN)
         self.__shutdown_request = True
         self.watch.join()
