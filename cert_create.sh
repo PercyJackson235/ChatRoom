@@ -9,11 +9,11 @@ if [ ! -d $cert_dir ]
 then
     mkdir $cert_dir
 fi
-if [ "$2" == '' ]
+if [ "$1" == '' ]
 then
     domain_name="pythonchatroom.com"
 else
-    domain_name="$2"
+    domain_name="$1"
 fi
 priv_key=$cert_dir"/key.pem"
 pub_key=$cert_dir"/cert.pem"
